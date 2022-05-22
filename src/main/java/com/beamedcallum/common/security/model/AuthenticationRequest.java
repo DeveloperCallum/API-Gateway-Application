@@ -1,5 +1,6 @@
 package com.beamedcallum.common.security.model;
 
+@Deprecated
 public class AuthenticationRequest {
     private String username;
     private String password;

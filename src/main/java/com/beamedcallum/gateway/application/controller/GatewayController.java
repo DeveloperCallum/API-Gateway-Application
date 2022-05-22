@@ -2,9 +2,12 @@ package com.beamedcallum.gateway.application.controller;
 
 import com.beamedcallum.common.database.UserEntry;
 import com.beamedcallum.common.database.UserRepository;
+import com.beamedcallum.common.rest.RetrieveAccount;
+import com.beamedcallum.common.rest.ValidateAccount;
 import com.beamedcallum.common.security.authorisation.GatewayTokenService;
 import com.beamedcallum.common.security.model.AuthenticationRequest;
 import com.beamedcallum.common.security.model.AuthenticationResponse;
+import com.beamedcallum.database.accounts.models.Account;
 import com.beamedcallum.gateway.authorization.refresh.RefreshTokenData;
 import com.beamedcallum.gateway.authorization.refresh.RefreshTokenService;
 import com.beamedcallum.gateway.authorization.tokens.jwt.JWTFactory;
@@ -15,10 +18,12 @@ import com.beamedcallum.gateway.tokens.exceptions.TokenIntegrityException;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import common.account.AccountBasicInfo;
 import common.discovery.DiscoveryUtils;
-import common.discovery.messages.ServiceFoundResponse;
+import common.discovery.messages.DiscoveryResponse;
 import common.exception.RestErrorObject;
 import common.exception.RestRuntimeException;
+import common.exception.ServerException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.*;
 import org.springframework.security.authentication.AuthenticationManager;
@@ -56,17 +61,18 @@ public class GatewayController {
     }
 
     @PostMapping("/api/login")
-    public AuthenticationResponse login(@RequestBody AuthenticationRequest authenticationRequest) {
-        try {
-            authenticationManager.authenticate(new UsernamePasswordAuthenticationToken(authenticationRequest.getUsername(), authenticationRequest.getPassword()));
-        } catch (BadCredentialsException e) {
+    public AuthenticationResponse<?, ?> login(@RequestBody AccountBasicInfo basicInfo) throws ServerException {
+        ValidateAccount checkAccount = new ValidateAccount(basicInfo.getUsername(), basicInfo.getPassword());
+
+        if (!checkAccount.isCorrect()){
             throw new RestRuntimeException("Bad Credentials", HttpStatus.FORBIDDEN);
         }
 
-        UserEntry user = userRepository.findById(authenticationRequest.getUsername()).get();
+        RetrieveAccount getAccount = new RetrieveAccount(basicInfo.getUsername());
+        Account account = getAccount.get();
 
         RefreshTokenData<JWTToken, JWTToken> tokens = gatewayTokenService.create();
-        gatewayTokenService.authoriseToken(user.getUsername(), user.getRoles(), tokens.getRefreshToken(), tokens.getAuthToken());
+        gatewayTokenService.authoriseToken(account.getUsername(), account.getRoleCSV(), tokens.getRefreshToken(), tokens.getAuthToken());
 
         return new AuthenticationResponse<>(tokens.getRefreshToken().get(), tokens.getAuthToken().get());
     }
@@ -91,13 +97,8 @@ public class GatewayController {
         throw new RestRuntimeException("Bad Credentials", HttpStatus.UNAUTHORIZED);
     }
 
-    @GetMapping("/api/authtest")
-    public String test() {
-        return "Authenticated";
-    }
-
     @PostMapping("/api/register")
-    public AuthenticationResponse register(@RequestBody AuthenticationRequest request) {
+    public AuthenticationResponse register(@RequestBody AccountBasicInfo request) throws ServerException {
         Optional<UserEntry> user = userRepository.findById(request.getUsername());
         user.ifPresentOrElse(userEntry -> {
             throw new RestRuntimeException("User already Exists!", HttpStatus.CONFLICT);
@@ -109,35 +110,44 @@ public class GatewayController {
         return login(request);
     }
 
-    @GetMapping("/api/{service}/**")
-    public ResponseEntity<?> getService(HttpServletRequest request, @PathVariable String service) {
-        //TODO: Dynamic Mapping / Read value from file.
+        @GetMapping("/api/{service}/**")
+    public ResponseEntity<?> proxyGet(HttpServletRequest request, @PathVariable String service) {
         String location = "localhost:8082";
-        ServiceFoundResponse serviceData = DiscoveryUtils.getServiceData(service, location);
+        DiscoveryResponse serviceData = DiscoveryUtils.getServiceData(service, location);
 
-        try {
-            JWTToken token = JWTFactory.getInstance().parseFromString(request.getHeader("Authorisation"));
+        if (serviceData.endpointExists(request.getRequestURL().toString())) {
+            String role = serviceData.getEndpointRole(request.getRequestURL().toString());
 
-            if (!hasRole(token, serviceData.getDefaultRole())) {
-                throw new RestRuntimeException("You do not have the required role!", HttpStatus.FORBIDDEN);
+            if (role == null) {
+                role = serviceData.getDefaultRole();
+            }
+
+            try {
+                JWTToken token = JWTFactory.getInstance().parseFromString(request.getHeader("Authorisation"));
+
+                if (!hasRole(token, role)) {
+                    throw new RestRuntimeException("You do not have the required role!", HttpStatus.FORBIDDEN);
+                }
+
+            } catch (JWTParseException | TokenIntegrityException e) {
+                throw new RestRuntimeException("Unexpected Error", HttpStatus.INTERNAL_SERVER_ERROR);
             }
 
             RestTemplate restTemplate = new RestTemplate();
             String serviceUrl = rewriteUrl(request, serviceData);
-            return restTemplate.getForObject(serviceUrl, ResponseEntity.class);
+            ResponseEntity<?> responseEntity = restTemplate.getForObject(serviceUrl, ResponseEntity.class);
 
-        } catch (JWTParseException | TokenIntegrityException e) {
-            throw new RestRuntimeException("Unexpected Error", HttpStatus.INTERNAL_SERVER_ERROR);
-        } catch (HttpClientErrorException e) {
-            throw new RestRuntimeException("This page does not exist", HttpStatus.NOT_FOUND);
+            return responseEntity;
         }
+
+        throw new RestRuntimeException("This page does not exist", HttpStatus.NOT_FOUND);
     }
 
     @PostMapping("/api/{service}/**")
     public ResponseEntity<?> getServicePost(HttpServletRequest request, @PathVariable String service, @RequestBody String body) throws JsonProcessingException {
         //TODO: Dynamic Mapping / Read value from file.
         String location = "localhost:8082";
-        ServiceFoundResponse serviceData = DiscoveryUtils.getServiceData(service, location);
+        DiscoveryResponse serviceData = DiscoveryUtils.getServiceData(service, location);
 
         try {
             JWTToken token = JWTFactory.getInstance().parseFromString(request.getHeader("Authorisation"));
@@ -173,7 +183,7 @@ public class GatewayController {
     public ResponseEntity<?> getServicePut(HttpServletRequest request, @PathVariable String service, @RequestBody String body) throws JsonProcessingException {
         //TODO: Dynamic Mapping / Read value from file.
         String location = "localhost:8082";
-        ServiceFoundResponse serviceData = DiscoveryUtils.getServiceData(service, location);
+        DiscoveryResponse serviceData = DiscoveryUtils.getServiceData(service, location);
 
         try {
             JWTToken token = JWTFactory.getInstance().parseFromString(request.getHeader("Authorisation"));
@@ -209,7 +219,7 @@ public class GatewayController {
     public ResponseEntity<?> getServiceDelete(HttpServletRequest request, @PathVariable String service, @RequestBody String body) throws JsonProcessingException {
         //TODO: Dynamic Mapping / Read value from file.
         String location = "localhost:8082";
-        ServiceFoundResponse serviceData = DiscoveryUtils.getServiceData(service, location);
+        DiscoveryResponse serviceData = DiscoveryUtils.getServiceData(service, location);
 
         try {
             JWTToken token = JWTFactory.getInstance().parseFromString(request.getHeader("Authorisation"));
@@ -247,7 +257,7 @@ public class GatewayController {
         return roleData.contains(role);
     }
 
-    private String rewriteUrl(HttpServletRequest request, ServiceFoundResponse serviceData) {
+    private String rewriteUrl(HttpServletRequest request, DiscoveryResponse serviceData) {
         String hostname = serviceData.getHostname();
 
         List<String> url = new LinkedList<>(Arrays.asList(request.getRequestURL().toString().replace("//", "/").split("/")));
